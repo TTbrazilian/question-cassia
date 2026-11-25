@@ -1,14 +1,17 @@
 """
 iG2P · Formulário de Inscrição — Processo Seletivo Público Simplificado nº 04/2026
 Secretaria Municipal de Saúde de Cássia - MG · Centro de Especialidades Odontológicas (CEO)
-Padrão visual dos dashboards iG2P (modo claro/escuro, faixas indigo, cards).
 
 Regras (iguais ao app de Cássia médico):
   - Gravação ATÔMICA/idempotente por token (evita duplicidade por duplo clique).
+  - Trava de 1 inscrição por CPF.
   - Protocolo sequencial lido da própria planilha.
-  - Tela de loading + rolagem ao topo + botão desabilitado durante o envio.
+  - Tela de loading que aparece NA HORA do clique (formulário some) + rolagem ao topo.
   - E-mail de confirmação com o número de inscrição.
   - Anexos enviados ao Google Drive; link vai para a planilha.
+
+Otimização de cota (Google Sheets): conexão em cache + 1 única leitura por inscrição
+(token + CPF + protocolo resolvidos juntos) + retentativa com backoff em caso de 429.
 """
 
 import os
@@ -16,6 +19,7 @@ import re
 import io
 import ssl
 import uuid
+import time
 import base64
 import random
 import smtplib
@@ -27,25 +31,20 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-PLANILHA_LOCAL = os.path.join(APP_DIR, "respostas_ceo.xlsx")
 BANDEIRA_PATH = os.path.join(APP_DIR, "cássiabandeira.png")
 
 # ----------------------------------------------------------------------------
 # JANELA DE INSCRIÇÕES  ——  conforme o Edital nº 04/2026 (inscrições 01 a 07/12/2026).
-# Fuso de Brasília. Use None em ambas para deixar BLOQUEADO ("em breve").
 # ----------------------------------------------------------------------------
 TZ = timezone(timedelta(hours=-3))  # Horário de Brasília (UTC-3)
-DATA_ABERTURA = datetime(2026, 11, 24, 0, 0, tzinfo=TZ)      # 01/12/2026 00h00
+DATA_ABERTURA = datetime(2026, 12, 1, 0, 0, tzinfo=TZ)       # 01/12/2026 (edital). Para testar agora, troque por uma data passada.
 DATA_ENCERRAMENTO = datetime(2026, 12, 7, 23, 59, tzinfo=TZ)  # 07/12/2026 23h59
 
-# Numeração sequencial do protocolo (acompanha a ordem das inscrições).
-NUMERO_INICIAL = 1000
+NUMERO_INICIAL = 1000  # número da 1ª inscrição
 
-# Anexos (documentos)
 EXTS_ANEXO = ["pdf", "jpg", "jpeg", "png"]
 TAMANHO_MAX_MB = 10
 
-# Funções pretendidas (seleção única) — exatamente como a Ficha de Inscrição (Anexo I)
 FUNCOES = [
     "Cirurgião-Dentista – Área de atuação em Endodontia (CEO)",
     "Cirurgião-Dentista – Área de atuação em Cirurgia Oral e Odontologia para Pacientes com Necessidades Especiais (CEO)",
@@ -79,9 +78,6 @@ COLUNAS_PLANILHA = [
     "Declaração - Ciência do Edital", "Declaração - Veracidade", "Declaração - LGPD",
 ]
 
-# ----------------------------------------------------------------------------
-# Tema (padrão iG2P) — dicionário claro/escuro dirige todo o CSS inline
-# ----------------------------------------------------------------------------
 TEMAS = {
     "claro": {
         "bg": "#F4F5FB", "card": "#FFFFFF", "texto": "#1E1F36",
@@ -106,16 +102,13 @@ st.set_page_config(
 for k, v in {"modo": "claro", "enviado": False, "protocolo": None, "destino": None,
              "motivo": None, "email_ok": None, "email_dest": None,
              "processando": False, "dados_pendentes": None, "erro_envio": None,
-             "token_gravado": None, "duplicado": False}.items():
+             "token_gravado": None, "duplicado": False, "erros_form": None}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 T = TEMAS[st.session_state.modo]
 
 
-# ----------------------------------------------------------------------------
-# CSS
-# ----------------------------------------------------------------------------
 def aplicar_css(t):
     st.markdown(f"""
     <style>
@@ -211,7 +204,6 @@ def aplicar_css(t):
     }}
     .ig2p-rodape {{ text-align:center; color:{t['texto2']}; font-size:.72rem; margin-top:26px; }}
 
-    /* Loading */
     .ig2p-loading {{
         background:{t['card']}; border:2px solid {t['primaria']}; border-radius:18px;
         padding:60px 30px; text-align:center; box-shadow:{t['sombra']};
@@ -259,7 +251,7 @@ def scroll_top():
 
 
 # ----------------------------------------------------------------------------
-# Validações
+# Validações / Máscaras
 # ----------------------------------------------------------------------------
 def so_digitos(v):
     return re.sub(r"\D", "", v or "")
@@ -300,9 +292,6 @@ def slug(texto):
     return t[:40] or "candidato"
 
 
-# ----------------------------------------------------------------------------
-# Máscaras
-# ----------------------------------------------------------------------------
 def mascara_cpf(texto):
     d = so_digitos(texto)[:11]
     if len(d) > 9:
@@ -375,8 +364,42 @@ def fmt_data_br(dt):
 
 
 # ----------------------------------------------------------------------------
-# Anexos — upload para o Google Drive (pasta em [drive].folder_id)
+# Infra Google (conexão em cache + retentativa com backoff p/ cota 429)
 # ----------------------------------------------------------------------------
+def _e_quota(e):
+    s = str(e)
+    return ("429" in s) or ("Quota exceeded" in s) or ("RESOURCE_EXHAUSTED" in s) or ("rateLimit" in s.lower())
+
+
+def _retry_api(fn, tentativas=4):
+    """Executa fn(); em erro de cota (429) espera e tenta de novo (backoff)."""
+    ultimo = None
+    for i in range(tentativas):
+        try:
+            return fn()
+        except Exception as e:  # noqa
+            ultimo = e
+            if _e_quota(e):
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise
+    raise ultimo
+
+
+@st.cache_resource(show_spinner=False)
+def _worksheet():
+    """Conexão com a planilha mantida em cache (evita reautenticar e reabrir a cada
+    inscrição — o que gerava leituras extras e estouro de cota)."""
+    import gspread  # type: ignore
+    from google.oauth2.service_account import Credentials  # type: ignore
+    escopos = ["https://www.googleapis.com/auth/spreadsheets"]
+    cred = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=escopos)
+    gc = gspread.authorize(cred)
+    sheet_id = st.secrets.get("planilha", {}).get("sheet_id", "")
+    return gc.open_by_key(sheet_id).sheet1
+
+
 def _drive_service():
     from google.oauth2.service_account import Credentials  # type: ignore
     from googleapiclient.discovery import build  # type: ignore
@@ -386,40 +409,115 @@ def _drive_service():
     return build("drive", "v3", credentials=cred, cache_discovery=False)
 
 
-def salvar_anexo(uploaded, token, nome_candidato, chave):
-    """Envia um anexo ao Drive e retorna (link, destino, motivo)."""
-    if uploaded is None:
-        return "", "vazio", None
-    ext = os.path.splitext(uploaded.name)[1].lower()
+def salvar_anexo_bytes(meta, token, nome_candidato, chave):
+    """Sobe um anexo (a partir dos bytes capturados no clique) ao Drive. Retorna o link."""
+    if not meta:
+        return ""
+    data = meta.get("bytes", b"")
+    name = meta.get("name", "arquivo")
+    mtype = meta.get("type", "application/octet-stream")
+    ext = os.path.splitext(name)[1].lower()
     nome_final = f"{token}_{chave}_{slug(nome_candidato)}{ext}"
     folder_id = st.secrets.get("drive", {}).get("folder_id", "")
-    motivo_drive = ""
     if "gcp_service_account" in st.secrets and folder_id:
         try:
             from googleapiclient.http import MediaIoBaseUpload  # type: ignore
             service = _drive_service()
-            media = MediaIoBaseUpload(
-                io.BytesIO(uploaded.getvalue()),
-                mimetype=uploaded.type or "application/octet-stream", resumable=False)
-            arq = service.files().create(
+            media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mtype, resumable=False)
+            arq = _retry_api(lambda: service.files().create(
                 body={"name": nome_final, "parents": [folder_id]},
                 media_body=media, fields="id,webViewLink",
-                supportsAllDrives=True).execute()
-            return arq.get("webViewLink", arq.get("id", "")), "drive", None
-        except Exception as e:
-            motivo_drive = f"{type(e).__name__}: {e}"
-    else:
-        motivo_drive = "Drive não configurado ([drive].folder_id ausente nos secrets)."
+                supportsAllDrives=True).execute())
+            return arq.get("webViewLink", arq.get("id", ""))
+        except Exception:
+            pass
     # Fallback local (apenas testes; no Streamlit Cloud o disco é efêmero)
     try:
         pasta = os.path.join(APP_DIR, "anexos")
         os.makedirs(pasta, exist_ok=True)
         caminho = os.path.join(pasta, nome_final)
         with open(caminho, "wb") as fp:
-            fp.write(uploaded.getvalue())
-        return caminho, "local", motivo_drive
+            fp.write(data)
+        return caminho
+    except Exception:
+        return ""
+
+
+def montar_linha(campos, links):
+    return [
+        agora().strftime("%d/%m/%Y %H:%M:%S"), "",  # protocolo definido ao gravar
+        campos["funcao"], campos["nome"], campos["cpf"], campos["nascimento"],
+        campos["email"], campos["telefone"], campos["endereco"],
+        campos["cro_num"], campos["cro_uf"],
+        links.get("diploma", ""), links.get("cro_cert", ""),
+        links.get("especializacao", ""), links.get("mestrado", ""),
+        links.get("cursos", ""), links.get("experiencia", ""),
+        "Sim" if campos["dec_edital"] else "Não",
+        "Sim" if campos["dec_verdade"] else "Não",
+        "Sim" if campos["dec_lgpd"] else "Não",
+    ]
+
+
+def salvar_inscricao(campos, anexos, token, nome):
+    """Grava a inscrição com UMA única leitura da planilha (resolve token + CPF +
+    protocolo juntos). Só sobe anexos se for inscrição nova (evita órfãos no Drive).
+    Retorna (destino, motivo, protocolo). destino: google | duplicado | erro."""
+    try:
+        ws = _worksheet()
     except Exception as e:
-        return "", "erro", f"Drive: {motivo_drive} | Local: {type(e).__name__}: {e}"
+        return "erro", f"Conexão com a planilha: {type(e).__name__}: {e}", None
+
+    # 1 leitura só:
+    try:
+        dados = _retry_api(lambda: ws.get_all_values())
+    except Exception as e:
+        return "erro", f"Leitura da planilha: {type(e).__name__}: {e}", None
+
+    # cabeçalho, se a planilha estiver vazia
+    if not dados:
+        try:
+            _retry_api(lambda: ws.append_row(COLUNAS_PLANILHA + ["Token"],
+                                             value_input_option="USER_ENTERED"))
+        except Exception as e:
+            return "erro", f"Criação do cabeçalho: {type(e).__name__}: {e}", None
+        dados = [COLUNAS_PLANILHA + ["Token"]]
+
+    col_token = len(COLUNAS_PLANILHA)  # índice 0-based da coluna Token
+
+    # idempotência por token (reentrada após rerun)
+    if token:
+        for i, r in enumerate(dados[1:], start=2):
+            if len(r) > col_token and r[col_token] == token:
+                proto = r[1] if len(r) > 1 and r[1] else str(NUMERO_INICIAL + (i - 2))
+                return "google", None, str(proto)
+
+    # trava anti-duplicidade por CPF (coluna 5 = índice 4)
+    cpf_novo = so_digitos(campos.get("cpf", ""))
+    if cpf_novo:
+        for i, r in enumerate(dados[1:], start=2):
+            if len(r) > 4 and so_digitos(r[4]) == cpf_novo:
+                return "duplicado", None, (r[1] if len(r) > 1 and r[1] else "—")
+
+    # inscrição nova: sobe anexos e grava
+    links = {}
+    for chave, meta in (anexos or {}).items():
+        links[chave] = salvar_anexo_bytes(meta, token, nome, chave)
+    linha = montar_linha(campos, links)
+    try:
+        resp = _retry_api(lambda: ws.append_row(linha + [token],
+                                                value_input_option="USER_ENTERED"))
+    except Exception as e:
+        return "erro", f"Gravação da linha: {type(e).__name__}: {e}", None
+
+    rng = (resp or {}).get("updates", {}).get("updatedRange", "")
+    m = re.search(r"[A-Za-z]+(\d+)", rng.split("!")[-1])
+    row = int(m.group(1)) if m else (len(dados) + 1)
+    protocolo = str(NUMERO_INICIAL + (row - 2))  # linha 2 = 1º inscrito
+    try:
+        _retry_api(lambda: ws.update_cell(row, 2, protocolo))
+    except Exception:
+        pass  # o número já está calculado corretamente
+    return "google", None, protocolo
 
 
 # ----------------------------------------------------------------------------
@@ -494,122 +592,7 @@ def enviar_email_confirmacao(destinatario, nome, protocolo, funcao):
 
 
 # ----------------------------------------------------------------------------
-# Persistência — Google Sheets (fonte oficial)
-# ----------------------------------------------------------------------------
-def conectar_sheets():
-    if "gcp_service_account" not in st.secrets:
-        return None, ("Secrets não foram lidos. No Streamlit Cloud: cole o conteúdo do "
-                      "secrets.toml em Manage app → Settings → Secrets.")
-    sheet_id = st.secrets.get("planilha", {}).get("sheet_id", "")
-    if not sheet_id or "COLE_AQUI" in sheet_id:
-        return None, "sheet_id não configurado em [planilha] no secrets.toml."
-    try:
-        import gspread  # type: ignore
-        from google.oauth2.service_account import Credentials  # type: ignore
-    except ImportError:
-        return None, "Bibliotecas gspread/google-auth não instaladas. Rode: pip install gspread google-auth"
-    try:
-        escopos = ["https://www.googleapis.com/auth/spreadsheets"]
-        cred = Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]), scopes=escopos)
-        gc = gspread.authorize(cred)
-        return gc.open_by_key(sheet_id).sheet1, None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-
-
-def buscar_inscricao_por_cpf(cpf):
-    """Consulta (sem gravar) se o CPF já tem inscrição. Retorna o protocolo existente ou None.
-    CPF está na coluna 5 (índice 4 na linha)."""
-    cpf = so_digitos(cpf)
-    if not cpf:
-        return None
-    try:
-        ws, _ = conectar_sheets()
-        if ws is not None:
-            for r in ws.get_all_values()[1:]:  # pula o cabeçalho
-                if len(r) > 4 and so_digitos(r[4]) == cpf:
-                    return r[1] if len(r) > 1 and r[1] else "—"
-    except Exception:
-        pass
-    return None
-
-
-def salvar_google_sheets(linha, token):
-    """Gravação IDEMPOTENTE e à prova de corrida, usando o token na última coluna.
-    (1) checa antes; (2) grava; (3) recheca e remove excedentes do mesmo token.
-    Depois do append, nenhum erro posterior retorna 'erro'. (status, motivo, protocolo)."""
-    ws, motivo = conectar_sheets()
-    if ws is None:
-        return "erro", motivo, None
-
-    col_token = len(COLUNAS_PLANILHA) + 1
-
-    def linhas_do_token():
-        try:
-            col = ws.col_values(col_token)
-        except Exception:
-            col = []
-        return [i + 1 for i, v in enumerate(col) if v and v == token]
-
-    try:
-        if not ws.row_values(1):
-            ws.append_row(COLUNAS_PLANILHA + ["Token"], value_input_option="USER_ENTERED")
-        if token:
-            existentes = linhas_do_token()
-            if existentes:
-                idx = existentes[0]
-                proto = ws.cell(idx, 2).value or str(NUMERO_INICIAL + (idx - 2))
-                return "ok", None, str(proto)
-        # Rede de segurança anti-duplicidade por CPF (coluna 5 = índice 4 na linha).
-        cpf_novo = so_digitos(linha[4]) if len(linha) > 4 else ""
-        if cpf_novo:
-            for r in ws.get_all_values()[1:]:
-                if len(r) > 4 and so_digitos(r[4]) == cpf_novo:
-                    return "duplicado", None, (r[1] if len(r) > 1 and r[1] else "—")
-        ws.append_row(linha + [token], value_input_option="USER_ENTERED")
-    except Exception as e:
-        return "erro", f"Falha ao gravar a linha: {type(e).__name__}: {e}", None
-
-    protocolo = None
-    try:
-        existentes = linhas_do_token() if token else []
-        if len(existentes) > 1:
-            for idx in sorted(existentes[1:], reverse=True):
-                try:
-                    ws.delete_rows(idx)
-                except Exception:
-                    pass
-            existentes = linhas_do_token()
-        row = existentes[0] if existentes else len(ws.col_values(1))
-        atual = ws.cell(row, 2).value
-        if atual:
-            protocolo = str(atual)
-        else:
-            protocolo = str(NUMERO_INICIAL + (row - 2))
-            ws.update_cell(row, 2, protocolo)
-    except Exception:
-        try:
-            existentes = linhas_do_token()
-            if existentes:
-                row = existentes[0]
-                protocolo = str(ws.cell(row, 2).value or (NUMERO_INICIAL + (row - 2)))
-        except Exception:
-            pass
-    return "ok", None, protocolo
-
-
-def salvar_resposta(linha, token):
-    status, motivo, protocolo = salvar_google_sheets(linha, token)
-    if status == "ok":
-        return "google", None, protocolo
-    if status == "duplicado":
-        return "duplicado", None, protocolo
-    return "erro", motivo, None
-
-
-# ----------------------------------------------------------------------------
-# Tela de sucesso
+# Tela de sucesso (inclui o caso "já possui inscrição")
 # ----------------------------------------------------------------------------
 if st.session_state.enviado:
     scroll_top()
@@ -632,6 +615,7 @@ if st.session_state.enviado:
         st.markdown('<div class="ig2p-rodape">iG2P · Inteligência em Gestão Pública · G3ST4O · Prefeitura de Cássia - MG</div>',
                     unsafe_allow_html=True)
         st.stop()
+
     if st.session_state.email_ok is True:
         email_badge = (f'<p style="color:{T["texto2"]};font-size:.85rem;margin-top:14px;">'
                        f'📧 Um e-mail de confirmação foi enviado para '
@@ -668,7 +652,7 @@ if st.session_state.enviado:
 
 
 # ----------------------------------------------------------------------------
-# Tela de processamento (loading) — grava e vai ao sucesso
+# Tela de processamento (loading) — aparece NA HORA do clique; grava e vai ao sucesso
 # ----------------------------------------------------------------------------
 if st.session_state.processando:
     scroll_top()
@@ -711,7 +695,9 @@ if st.session_state.processando:
         st.session_state.enviado = True
         st.rerun()
 
-    destino, motivo, protocolo = salvar_resposta(dados.get("linha", []), token_atual)
+    destino, motivo, protocolo = salvar_inscricao(
+        dados.get("campos", {}), dados.get("anexos", {}), token_atual, dados.get("nome", ""))
+
     if destino == "erro":
         st.session_state.erro_envio = motivo
         st.rerun()
@@ -728,8 +714,6 @@ if st.session_state.processando:
             dados.get("email", ""), dados.get("nome", ""), protocolo, dados.get("funcao", ""))
         st.session_state.email_ok = email_ok
         st.session_state.email_dest = dados.get("email", "")
-        st.session_state.destino = destino
-        st.session_state.motivo = motivo
         st.session_state.protocolo = protocolo
         st.session_state.token_gravado = token_atual
         st.session_state.dados_pendentes = None
@@ -809,34 +793,29 @@ A inscrição é <b>única por CPF</b> — se já houver uma inscrição com o s
 </div>
 """, unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------------
 # 1. FUNÇÃO PRETENDIDA
-# ----------------------------------------------------------------------------
 st.markdown('<div class="ig2p-faixa">1. Função Pretendida</div>', unsafe_allow_html=True)
-funcao = st.selectbox("1. Selecione a função para inscrição *", ["— Selecione —"] + FUNCOES)
+funcao = st.selectbox("1. Selecione a função para inscrição *", ["— Selecione —"] + FUNCOES,
+                      key="funcao_sel")
 is_dent = e_dentista(funcao)
 
-# ----------------------------------------------------------------------------
 # 2. DADOS PESSOAIS
-# ----------------------------------------------------------------------------
 st.markdown('<div class="ig2p-faixa">2. Dados Pessoais</div>', unsafe_allow_html=True)
-nome = st.text_input("2. Nome Completo (sem abreviações) *")
+nome = st.text_input("2. Nome Completo (sem abreviações) *", key="nome")
 cpf = st.text_input("3. CPF — digite apenas os números *",
                     key="cpf", max_chars=14, on_change=fmt_cpf,
                     help="A pontuação (000.000.000-00) é aplicada automaticamente.")
 nascimento = st.text_input("4. Data de Nascimento (dia/mês/ano) — Ex: 01/01/1990 *",
                            key="nascimento", max_chars=10, on_change=fmt_nascimento,
                            help="Digite só os números — a barra é inserida automaticamente.")
-email = st.text_input("5. E-mail *",
+email = st.text_input("5. E-mail *", key="email",
                       help="Será usado para o envio da confirmação e das comunicações do processo.")
 telefone = st.text_input("6. Telefone para contato / WhatsApp (com DDD) *",
                          key="telefone", max_chars=16, on_change=fmt_tel)
-endereco = st.text_area("7. Endereço residencial completo *", height=90,
+endereco = st.text_area("7. Endereço residencial completo *", height=90, key="endereco",
                         help="Logradouro, número, complemento, bairro, município, estado e CEP.")
 
-# ----------------------------------------------------------------------------
 # 3. FORMAÇÃO E DOCUMENTAÇÃO
-# ----------------------------------------------------------------------------
 st.markdown('<div class="ig2p-faixa">3. Formação e Documentação</div>', unsafe_allow_html=True)
 st.markdown(f"""
 <div class="ig2p-legal">
@@ -850,7 +829,7 @@ curricular, conforme o Anexo V do Edital.
 st.markdown("**Registro profissional no Conselho Regional de Odontologia (CRO)**")
 c1, c2 = st.columns([3, 1])
 with c1:
-    cro_num = st.text_input("8. Número do registro no CRO *")
+    cro_num = st.text_input("8. Número do registro no CRO *", key="cro_num")
 with c2:
     cro_uf = st.text_input("UF *", key="cro_uf", max_chars=2, on_change=fmt_cro_uf,
                            help="Sigla do estado, ex.: MG")
@@ -866,109 +845,117 @@ for chave, rotulo, obrig, so_dent in ANEXOS:
                                        type=EXTS_ANEXO, key=f"file_{chave}")
     n += 1
 
-# ----------------------------------------------------------------------------
 # 4. DECLARAÇÕES
-# ----------------------------------------------------------------------------
 st.markdown('<div class="ig2p-faixa">4. Declarações</div>', unsafe_allow_html=True)
 dec_edital = st.checkbox(
     "Declaro que li e estou ciente das disposições estabelecidas no Edital do Processo Seletivo "
     "Público Simplificado da Secretaria Municipal de Saúde de Cássia/MG, comprometendo-me a cumprir "
-    "integralmente suas normas, condições e exigências. *")
+    "integralmente suas normas, condições e exigências. *", key="dec_edital")
 dec_verdade = st.checkbox(
     "Declaro, sob as penas da lei, que todas as informações prestadas e os documentos apresentados "
     "no ato da inscrição são verdadeiros e autênticos, estando ciente de que a constatação de "
     "informações falsas ou irregularidades poderá resultar no indeferimento da inscrição ou na "
-    "eliminação do processo seletivo. *")
+    "eliminação do processo seletivo, observadas as disposições do edital e da legislação vigente. *",
+    key="dec_verdade")
 dec_lgpd = st.checkbox(
     "Declaro estar ciente de que os dados pessoais e documentos fornecidos serão tratados pela "
     "Prefeitura Municipal de Cássia/MG para fins de inscrição, análise documental, classificação, "
-    "divulgação de resultados e demais procedimentos administrativos do Processo Seletivo. *")
+    "divulgação de resultados e demais procedimentos administrativos relacionados ao Processo "
+    "Seletivo Público Simplificado. *", key="dec_lgpd")
 
-# ----------------------------------------------------------------------------
 # ENVIO + VALIDAÇÃO
-# ----------------------------------------------------------------------------
 st.markdown("<br>", unsafe_allow_html=True)
-if st.button("Enviar inscrição", disabled=st.session_state.processando):
+
+
+def _ao_enviar():
+    """Callback do botão. Roda ANTES da re-renderização: valida tudo lendo do
+    session_state, captura os bytes dos anexos (sobrevivem ao rerun) e marca
+    'processando'. Como é on_click, o Streamlit re-renderiza já na tela de loading
+    (o formulário some na hora) e o botão fica bloqueado — sem duplo clique e sem
+    o segundo st.rerun() que deixava a transição lenta."""
+    funcao_v = st.session_state.get("funcao_sel", "— Selecione —")
+    is_dent_v = e_dentista(funcao_v)
+    nome_v = st.session_state.get("nome", "") or ""
+    cpf_v = st.session_state.get("cpf", "") or ""
+    nasc_v = st.session_state.get("nascimento", "") or ""
+    email_v = st.session_state.get("email", "") or ""
+    tel_v = st.session_state.get("telefone", "") or ""
+    end_v = st.session_state.get("endereco", "") or ""
+    cronum_v = st.session_state.get("cro_num", "") or ""
+    crouf_v = st.session_state.get("cro_uf", "") or ""
+    dec_e = st.session_state.get("dec_edital", False)
+    dec_v = st.session_state.get("dec_verdade", False)
+    dec_l = st.session_state.get("dec_lgpd", False)
+
     erros = []
-    if funcao == "— Selecione —":
+    if funcao_v == "— Selecione —":
         erros.append("Selecione a função pretendida.")
-    if not nome.strip() or len(nome.split()) < 2:
+    if not nome_v.strip() or len(nome_v.split()) < 2:
         erros.append("Informe o nome completo, sem abreviações.")
-    if not cpf_valido(cpf):
+    if not cpf_valido(cpf_v):
         erros.append("CPF inválido — informe os 11 números.")
-    if not data_valida(nascimento):
+    if not data_valida(nasc_v):
         erros.append("Data de nascimento inválida — use o formato dia/mês/ano (ex: 01/01/1990).")
-    if not email_valido(email):
+    if not email_valido(email_v):
         erros.append("Informe um e-mail válido.")
-    if not telefone_valido(telefone):
+    if not telefone_valido(tel_v):
         erros.append("Telefone inválido — informe DDD + número.")
-    if not endereco.strip():
+    if not end_v.strip():
         erros.append("Informe o endereço residencial completo.")
-    if not cro_num.strip():
+    if not cronum_v.strip():
         erros.append("Informe o número do registro no CRO.")
-    if len(cro_uf.strip()) != 2:
+    if len(crouf_v.strip()) != 2:
         erros.append("Informe a UF do registro no CRO (2 letras).")
+    anexos = {}
     for chave, rotulo, obrig, so_dent in ANEXOS:
-        if so_dent and not is_dent:
+        if so_dent and not is_dent_v:
             continue
-        arq = arquivos.get(chave)
+        arq = st.session_state.get(f"file_{chave}")
         if arq is None:
             if obrig:
                 erros.append(f"Anexe: {rotulo}.")
-        elif len(arq.getvalue()) > TAMANHO_MAX_MB * 1024 * 1024:
-            erros.append(f"O arquivo '{rotulo}' excede {TAMANHO_MAX_MB} MB.")
-    if not dec_edital:
+        else:
+            b = arq.getvalue()
+            if len(b) > TAMANHO_MAX_MB * 1024 * 1024:
+                erros.append(f"O arquivo '{rotulo}' excede {TAMANHO_MAX_MB} MB.")
+            else:
+                anexos[chave] = {"bytes": b, "name": arq.name,
+                                 "type": arq.type or "application/octet-stream"}
+    if not dec_e:
         erros.append("É necessário aceitar a declaração de ciência e concordância com o edital.")
-    if not dec_verdade:
+    if not dec_v:
         erros.append("É necessário aceitar a declaração de veracidade das informações.")
-    if not dec_lgpd:
+    if not dec_l:
         erros.append("É necessário aceitar a declaração de ciência sobre o tratamento de dados pessoais.")
 
     if erros:
-        st.markdown(
-            f'<div class="ig2p-card" style="border-color:{T["erro"]};">'
-            f'<b style="color:{T["erro"]};">Corrija os campos abaixo:</b><ul>'
-            + "".join(f"<li style=\"color:{T['texto2']};\">{e}</li>" for e in erros)
-            + "</ul></div>", unsafe_allow_html=True)
-    else:
-        # Anti-duplicidade por CPF: se já existe inscrição, não cria outra nem sobe anexos.
-        ja_protocolo = buscar_inscricao_por_cpf(cpf)
-        if ja_protocolo is not None:
-            st.session_state.protocolo = ja_protocolo
-            st.session_state.duplicado = True
-            st.session_state.email_ok = None
-            st.session_state.enviado = True
-            st.rerun()
+        st.session_state.erros_form = erros
+        return
 
-        token = uuid.uuid4().hex
-        # Uploads AGORA (o file_uploader não sobrevive ao st.rerun()).
-        links = {}
-        with st.spinner("Enviando documentos..."):
-            for chave, rotulo, obrig, so_dent in ANEXOS:
-                if so_dent and not is_dent:
-                    links[chave] = ""
-                    continue
-                link, _dest, _mot = salvar_anexo(arquivos.get(chave), token, nome.strip(), chave)
-                links[chave] = link
+    st.session_state.erros_form = None
+    st.session_state.dados_pendentes = {
+        "campos": {
+            "funcao": funcao_v, "nome": nome_v.strip(), "cpf": cpf_v.strip(),
+            "nascimento": nasc_v.strip(), "email": email_v.strip(),
+            "telefone": tel_v.strip(), "endereco": end_v.strip(),
+            "cro_num": cronum_v.strip(), "cro_uf": crouf_v.strip().upper(),
+            "dec_edital": dec_e, "dec_verdade": dec_v, "dec_lgpd": dec_l,
+        },
+        "anexos": anexos,
+        "email": email_v.strip(), "nome": nome_v.strip(), "funcao": funcao_v,
+        "token": uuid.uuid4().hex,
+    }
+    st.session_state.processando = True
 
-        st.session_state.dados_pendentes = {
-            "linha": [
-                agora().strftime("%d/%m/%Y %H:%M:%S"), "",  # protocolo definido ao gravar
-                funcao, nome.strip(), cpf.strip(), nascimento.strip(),
-                email.strip(), telefone.strip(), endereco.strip(),
-                cro_num.strip(), cro_uf.strip().upper(),
-                links.get("diploma", ""), links.get("cro_cert", ""),
-                links.get("especializacao", ""), links.get("mestrado", ""),
-                links.get("cursos", ""), links.get("experiencia", ""),
-                "Sim" if dec_edital else "Não",
-                "Sim" if dec_verdade else "Não",
-                "Sim" if dec_lgpd else "Não",
-            ],
-            "email": email.strip(), "nome": nome.strip(), "funcao": funcao,
-            "token": token,
-        }
-        st.session_state.processando = True
-        st.rerun()
+
+st.button("Enviar inscrição", disabled=st.session_state.processando, on_click=_ao_enviar)
+
+if st.session_state.get("erros_form"):
+    st.markdown(
+        f'<div class="ig2p-card" style="border-color:{T["erro"]};">'
+        f'<b style="color:{T["erro"]};">Corrija os campos abaixo:</b><ul>'
+        + "".join(f"<li style=\"color:{T['texto2']};\">{e}</li>" for e in st.session_state.erros_form)
+        + "</ul></div>", unsafe_allow_html=True)
 
 st.markdown(
     f'<div style="margin-top:26px;padding:16px 18px;border-radius:14px;'
