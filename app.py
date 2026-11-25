@@ -70,7 +70,8 @@ ANEXOS = [
 
 COLUNAS_PLANILHA = [
     "Data/Hora do Envio", "Protocolo", "Função Pretendida", "Nome Completo", "CPF",
-    "Data de Nascimento", "E-mail", "Telefone/WhatsApp", "Endereço",
+    "Data de Nascimento", "E-mail", "Telefone/WhatsApp",
+    "Endereço", "Número", "Bairro", "CEP", "Complemento",
     "Registro CRO (nº)", "Registro CRO (UF)",
     "Diploma/Habilitação (link)", "Certidão Regularidade CRO (link)",
     "Pós-Grad. Especialização (link)", "Mestrado/Doutorado (link)",
@@ -341,6 +342,21 @@ def fmt_cro_uf():
     st.session_state.cro_uf = re.sub(r"[^A-Za-z]", "", st.session_state.cro_uf).upper()[:2]
 
 
+def mascara_cep(texto):
+    d = so_digitos(texto)[:8]
+    if len(d) > 5:
+        return f"{d[:5]}-{d[5:]}"
+    return d
+
+
+def fmt_cep():
+    st.session_state.cep = mascara_cep(st.session_state.cep)
+
+
+def cep_valido(cep):
+    return len(so_digitos(cep)) == 8
+
+
 # ----------------------------------------------------------------------------
 # Janela de inscrições
 # ----------------------------------------------------------------------------
@@ -447,7 +463,8 @@ def montar_linha(campos, links):
     return [
         agora().strftime("%d/%m/%Y %H:%M:%S"), "",  # protocolo definido ao gravar
         campos["funcao"], campos["nome"], campos["cpf"], campos["nascimento"],
-        campos["email"], campos["telefone"], campos["endereco"],
+        campos["email"], campos["telefone"],
+        campos["endereco"], campos["numero"], campos["bairro"], campos["cep"], campos["complemento"],
         campos["cro_num"], campos["cro_uf"],
         links.get("diploma", ""), links.get("cro_cert", ""),
         links.get("especializacao", ""), links.get("mestrado", ""),
@@ -609,8 +626,11 @@ if st.session_state.enviado:
             f'<a href="mailto:smscassiamg@gmail.com" style="color:{T["primaria"]};font-weight:700;'
             f'text-decoration:none;">smscassiamg@gmail.com</a>.</p></div>', unsafe_allow_html=True)
         if st.button("Voltar"):
-            for k in ("enviado", "protocolo", "duplicado"):
-                st.session_state[k] = False if k in ("enviado", "duplicado") else None
+            for k in ("enviado", "duplicado", "processando"):
+                st.session_state[k] = False
+            for k in ("protocolo", "token_gravado", "dados_pendentes", "erros_form",
+                      "erro_envio", "email_ok"):
+                st.session_state[k] = None
             st.rerun()
         st.markdown('<div class="ig2p-rodape">iG2P · Inteligência em Gestão Pública · G3ST4O · Prefeitura de Cássia - MG</div>',
                     unsafe_allow_html=True)
@@ -643,8 +663,11 @@ if st.session_state.enviado:
         f'{email_badge}{contato_box}'
         f'</div>', unsafe_allow_html=True)
     if st.button("Nova inscrição"):
-        for k in ("enviado", "protocolo", "duplicado"):
-            st.session_state[k] = False if k in ("enviado", "duplicado") else None
+        for k in ("enviado", "duplicado", "processando"):
+            st.session_state[k] = False
+        for k in ("protocolo", "token_gravado", "dados_pendentes", "erros_form",
+                  "erro_envio", "email_ok"):
+            st.session_state[k] = None
         st.rerun()
     st.markdown('<div class="ig2p-rodape">iG2P · Inteligência em Gestão Pública · G3ST4O · Prefeitura de Cássia - MG</div>',
                 unsafe_allow_html=True)
@@ -812,8 +835,19 @@ email = st.text_input("5. E-mail *", key="email",
                       help="Será usado para o envio da confirmação e das comunicações do processo.")
 telefone = st.text_input("6. Telefone para contato / WhatsApp (com DDD) *",
                          key="telefone", max_chars=16, on_change=fmt_tel)
-endereco = st.text_area("7. Endereço residencial completo *", height=90, key="endereco",
-                        help="Logradouro, número, complemento, bairro, município, estado e CEP.")
+endereco = st.text_input("7. Endereço (rua / avenida / logradouro) *", key="endereco")
+cae1, cae2 = st.columns([1, 2])
+with cae1:
+    numero = st.text_input("8. Número *", key="numero")
+with cae2:
+    bairro = st.text_input("9. Bairro *", key="bairro")
+cae3, cae4 = st.columns([1, 2])
+with cae3:
+    cep = st.text_input("10. CEP *", key="cep", max_chars=9, on_change=fmt_cep,
+                        help="Digite só os números — o traço é inserido automaticamente.")
+with cae4:
+    complemento = st.text_input("11. Complemento (opcional)", key="complemento",
+                                help="Apto, bloco, casa, ponto de referência etc. Deixe em branco se não houver.")
 
 # 3. FORMAÇÃO E DOCUMENTAÇÃO
 st.markdown('<div class="ig2p-faixa">3. Formação e Documentação</div>', unsafe_allow_html=True)
@@ -829,13 +863,13 @@ curricular, conforme o Anexo V do Edital.
 st.markdown("**Registro profissional no Conselho Regional de Odontologia (CRO)**")
 c1, c2 = st.columns([3, 1])
 with c1:
-    cro_num = st.text_input("8. Número do registro no CRO *", key="cro_num")
+    cro_num = st.text_input("12. Número do registro no CRO *", key="cro_num")
 with c2:
     cro_uf = st.text_input("UF *", key="cro_uf", max_chars=2, on_change=fmt_cro_uf,
                            help="Sigla do estado, ex.: MG")
 
 arquivos = {}
-n = 9
+n = 13
 for chave, rotulo, obrig, so_dent in ANEXOS:
     if so_dent and not is_dent:
         arquivos[chave] = None
@@ -881,6 +915,10 @@ def _ao_enviar():
     email_v = st.session_state.get("email", "") or ""
     tel_v = st.session_state.get("telefone", "") or ""
     end_v = st.session_state.get("endereco", "") or ""
+    num_v = st.session_state.get("numero", "") or ""
+    bairro_v = st.session_state.get("bairro", "") or ""
+    cep_v = st.session_state.get("cep", "") or ""
+    compl_v = st.session_state.get("complemento", "") or ""
     cronum_v = st.session_state.get("cro_num", "") or ""
     crouf_v = st.session_state.get("cro_uf", "") or ""
     dec_e = st.session_state.get("dec_edital", False)
@@ -901,7 +939,13 @@ def _ao_enviar():
     if not telefone_valido(tel_v):
         erros.append("Telefone inválido — informe DDD + número.")
     if not end_v.strip():
-        erros.append("Informe o endereço residencial completo.")
+        erros.append("Informe o endereço (rua / avenida / logradouro).")
+    if not num_v.strip():
+        erros.append("Informe o número do endereço.")
+    if not bairro_v.strip():
+        erros.append("Informe o bairro.")
+    if not cep_valido(cep_v):
+        erros.append("CEP inválido — informe os 8 números.")
     if not cronum_v.strip():
         erros.append("Informe o número do registro no CRO.")
     if len(crouf_v.strip()) != 2:
@@ -938,6 +982,8 @@ def _ao_enviar():
             "funcao": funcao_v, "nome": nome_v.strip(), "cpf": cpf_v.strip(),
             "nascimento": nasc_v.strip(), "email": email_v.strip(),
             "telefone": tel_v.strip(), "endereco": end_v.strip(),
+            "numero": num_v.strip(), "bairro": bairro_v.strip(),
+            "cep": cep_v.strip(), "complemento": compl_v.strip(),
             "cro_num": cronum_v.strip(), "cro_uf": crouf_v.strip().upper(),
             "dec_edital": dec_e, "dec_verdade": dec_v, "dec_lgpd": dec_l,
         },
