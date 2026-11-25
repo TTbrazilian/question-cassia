@@ -35,7 +35,7 @@ BANDEIRA_PATH = os.path.join(APP_DIR, "cássiabandeira.png")
 # Fuso de Brasília. Use None em ambas para deixar BLOQUEADO ("em breve").
 # ----------------------------------------------------------------------------
 TZ = timezone(timedelta(hours=-3))  # Horário de Brasília (UTC-3)
-DATA_ABERTURA = datetime(2026, 12, 1, 0, 0, tzinfo=TZ)      # 01/12/2026 00h00
+DATA_ABERTURA = datetime(2026, 11, 24, 0, 0, tzinfo=TZ)      # 01/12/2026 00h00
 DATA_ENCERRAMENTO = datetime(2026, 12, 7, 23, 59, tzinfo=TZ)  # 07/12/2026 23h59
 
 # Numeração sequencial do protocolo (acompanha a ordem das inscrições).
