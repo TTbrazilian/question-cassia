@@ -280,8 +280,11 @@ def telefone_valido(tel):
 
 
 def data_valida(s):
+    d = so_digitos(s)
+    if len(d) != 8:
+        return False
     try:
-        datetime.strptime((s or "").strip(), "%d/%m/%Y")
+        datetime.strptime(d, "%d%m%Y")
         return True
     except ValueError:
         return False
@@ -426,37 +429,33 @@ def _drive_service():
 
 
 def salvar_anexo_bytes(meta, token, nome_candidato, chave):
-    """Sobe um anexo (a partir dos bytes capturados no clique) ao Drive. Retorna o link."""
+    """Sobe um anexo ao Drive. Retorna (link, erro). erro=None em caso de sucesso."""
     if not meta:
-        return ""
+        return "", None
     data = meta.get("bytes", b"")
     name = meta.get("name", "arquivo")
     mtype = meta.get("type", "application/octet-stream")
     ext = os.path.splitext(name)[1].lower()
     nome_final = f"{token}_{chave}_{slug(nome_candidato)}{ext}"
     folder_id = st.secrets.get("drive", {}).get("folder_id", "")
-    if "gcp_service_account" in st.secrets and folder_id:
-        try:
-            from googleapiclient.http import MediaIoBaseUpload  # type: ignore
-            service = _drive_service()
-            media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mtype, resumable=False)
-            arq = _retry_api(lambda: service.files().create(
-                body={"name": nome_final, "parents": [folder_id]},
-                media_body=media, fields="id,webViewLink",
-                supportsAllDrives=True).execute())
-            return arq.get("webViewLink", arq.get("id", ""))
-        except Exception:
-            pass
-    # Fallback local (apenas testes; no Streamlit Cloud o disco é efêmero)
+    if "gcp_service_account" not in st.secrets:
+        return "", "Credenciais do Google (gcp_service_account) ausentes nos secrets."
+    if not folder_id:
+        return "", "folder_id da pasta do Drive não configurado em [drive] nos secrets."
     try:
-        pasta = os.path.join(APP_DIR, "anexos")
-        os.makedirs(pasta, exist_ok=True)
-        caminho = os.path.join(pasta, nome_final)
-        with open(caminho, "wb") as fp:
-            fp.write(data)
-        return caminho
-    except Exception:
-        return ""
+        from googleapiclient.http import MediaIoBaseUpload  # type: ignore
+        service = _drive_service()
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mtype, resumable=False)
+        arq = _retry_api(lambda: service.files().create(
+            body={"name": nome_final, "parents": [folder_id]},
+            media_body=media, fields="id,webViewLink",
+            supportsAllDrives=True).execute())
+        link = arq.get("webViewLink") or arq.get("id", "")
+        if not link:
+            return "", "Upload sem retorno de link (verifique permissões da pasta)."
+        return link, None
+    except Exception as e:
+        return "", f"{type(e).__name__}: {str(e)[:220]}"
 
 
 def montar_linha(campos, links):
@@ -508,17 +507,25 @@ def salvar_inscricao(campos, anexos, token, nome):
                 proto = r[1] if len(r) > 1 and r[1] else str(NUMERO_INICIAL + (i - 2))
                 return "google", None, str(proto)
 
-    # trava anti-duplicidade por CPF (coluna 5 = índice 4)
+    # trava anti-duplicidade por CPF + Função (permite 1 inscrição por função).
+    # Função = índice 2, CPF = índice 4.
     cpf_novo = so_digitos(campos.get("cpf", ""))
+    func_novo = (campos.get("funcao", "") or "").strip()
     if cpf_novo:
         for i, r in enumerate(dados[1:], start=2):
-            if len(r) > 4 and so_digitos(r[4]) == cpf_novo:
+            mesmo_cpf = len(r) > 4 and so_digitos(r[4]) == cpf_novo
+            mesma_func = len(r) > 2 and r[2].strip() == func_novo
+            if mesmo_cpf and mesma_func:
                 return "duplicado", None, (r[1] if len(r) > 1 and r[1] else "—")
 
-    # inscrição nova: sobe anexos e grava
+    # inscrição nova: sobe anexos e grava. Se algum anexo falhar no Drive, NÃO grava a
+    # linha e retorna o motivo (evita inscrição sem documentos e deixa o erro visível).
     links = {}
     for chave, meta in (anexos or {}).items():
-        links[chave] = salvar_anexo_bytes(meta, token, nome, chave)
+        link, erro_up = salvar_anexo_bytes(meta, token, nome, chave)
+        if erro_up:
+            return "erro", f"Falha ao enviar o documento ao Drive ({chave}): {erro_up}", None
+        links[chave] = link
     linha = montar_linha(campos, links)
     try:
         resp = _retry_api(lambda: ws.append_row(linha + [token],
@@ -618,8 +625,8 @@ if st.session_state.enviado:
             f'<div class="ig2p-success" style="border-color:{T["primaria"]};">'
             f'<div class="check" style="background:{T["primaria"]}1a;color:{T["primaria"]};">ℹ️</div>'
             f'<h2 style="color:{T["texto"]};margin:0;">Você já possui uma inscrição</h2>'
-            f'<p style="color:{T["texto2"]};margin:8px 0 0;">Encontramos uma inscrição com este CPF. '
-            f'Não é necessário se inscrever novamente. Seu número de inscrição é:</p>'
+            f'<p style="color:{T["texto2"]};margin:8px 0 0;">Encontramos uma inscrição sua para esta '
+            f'função. Não é necessário se inscrever novamente para o mesmo cargo. Seu número de inscrição é:</p>'
             f'<div class="ig2p-prot">{st.session_state.protocolo}</div>'
             f'<p style="color:{T["texto2"]};font-size:.8rem;margin-top:14px;">'
             f'Se você acredita que isso é um engano, entre em contato pelo e-mail '
@@ -811,7 +818,7 @@ da Secretaria Municipal de Saúde de Cássia - MG.<br><br>
 A constatação, a qualquer tempo, de falsidade ou omissão de dados implicará na eliminação
 do candidato. Não haverá conferência de documentos no ato da inscrição, nem será aceita a
 entrega posterior dos mesmos.<br><br>
-A inscrição é <b>única por CPF</b> — se já houver uma inscrição com o seu CPF, o sistema mostrará o número existente.<br><br>
+Você pode se inscrever em <b>mais de uma função</b>, porém é permitida apenas <b>uma inscrição por função</b> — se já houver uma inscrição sua para a função escolhida, o sistema mostrará o número existente.<br><br>
 <span style="color:{T['erro']};font-weight:600;">*</span> Indica uma pergunta obrigatória.
 </div>
 """, unsafe_allow_html=True)
@@ -825,16 +832,15 @@ is_dent = e_dentista(funcao)
 # 2. DADOS PESSOAIS
 st.markdown('<div class="ig2p-faixa">2. Dados Pessoais</div>', unsafe_allow_html=True)
 nome = st.text_input("2. Nome Completo (sem abreviações) *", key="nome")
-cpf = st.text_input("3. CPF — digite apenas os números *",
-                    key="cpf", max_chars=14, on_change=fmt_cpf,
-                    help="A pontuação (000.000.000-00) é aplicada automaticamente.")
+cpf = st.text_input("3. CPF — digite apenas os números *", key="cpf", max_chars=14,
+                    help="Pode digitar só os números; a pontuação é aplicada ao registrar.")
 nascimento = st.text_input("4. Data de Nascimento (dia/mês/ano) — Ex: 01/01/1990 *",
-                           key="nascimento", max_chars=10, on_change=fmt_nascimento,
-                           help="Digite só os números — a barra é inserida automaticamente.")
+                           key="nascimento", max_chars=10,
+                           help="Pode digitar só os números (01011990).")
 email = st.text_input("5. E-mail *", key="email",
                       help="Será usado para o envio da confirmação e das comunicações do processo.")
 telefone = st.text_input("6. Telefone para contato / WhatsApp (com DDD) *",
-                         key="telefone", max_chars=16, on_change=fmt_tel)
+                         key="telefone", max_chars=16)
 endereco = st.text_input("7. Endereço (rua / avenida / logradouro) *", key="endereco")
 cae1, cae2 = st.columns([1, 2])
 with cae1:
@@ -843,8 +849,8 @@ with cae2:
     bairro = st.text_input("9. Bairro *", key="bairro")
 cae3, cae4 = st.columns([1, 2])
 with cae3:
-    cep = st.text_input("10. CEP *", key="cep", max_chars=9, on_change=fmt_cep,
-                        help="Digite só os números — o traço é inserido automaticamente.")
+    cep = st.text_input("10. CEP *", key="cep", max_chars=9,
+                        help="Pode digitar só os números (00000000).")
 with cae4:
     complemento = st.text_input("11. Complemento (opcional)", key="complemento",
                                 help="Apto, bloco, casa, ponto de referência etc. Deixe em branco se não houver.")
@@ -865,7 +871,7 @@ c1, c2 = st.columns([3, 1])
 with c1:
     cro_num = st.text_input("12. Número do registro no CRO *", key="cro_num")
 with c2:
-    cro_uf = st.text_input("UF *", key="cro_uf", max_chars=2, on_change=fmt_cro_uf,
+    cro_uf = st.text_input("UF *", key="cro_uf", max_chars=2,
                            help="Sigla do estado, ex.: MG")
 
 arquivos = {}
@@ -979,11 +985,11 @@ def _ao_enviar():
     st.session_state.erros_form = None
     st.session_state.dados_pendentes = {
         "campos": {
-            "funcao": funcao_v, "nome": nome_v.strip(), "cpf": cpf_v.strip(),
-            "nascimento": nasc_v.strip(), "email": email_v.strip(),
-            "telefone": tel_v.strip(), "endereco": end_v.strip(),
+            "funcao": funcao_v, "nome": nome_v.strip(), "cpf": mascara_cpf(cpf_v),
+            "nascimento": mascara_data(nasc_v), "email": email_v.strip(),
+            "telefone": mascara_tel(tel_v), "endereco": end_v.strip(),
             "numero": num_v.strip(), "bairro": bairro_v.strip(),
-            "cep": cep_v.strip(), "complemento": compl_v.strip(),
+            "cep": mascara_cep(cep_v), "complemento": compl_v.strip(),
             "cro_num": cronum_v.strip(), "cro_uf": crouf_v.strip().upper(),
             "dec_edital": dec_e, "dec_verdade": dec_v, "dec_lgpd": dec_l,
         },
