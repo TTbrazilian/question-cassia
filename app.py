@@ -37,7 +37,7 @@ BANDEIRA_PATH = os.path.join(APP_DIR, "cássiabandeira.png")
 # JANELA DE INSCRIÇÕES  ——  conforme o Edital nº 04/2026 (inscrições 01 a 07/12/2026).
 # ----------------------------------------------------------------------------
 TZ = timezone(timedelta(hours=-3))  # Horário de Brasília (UTC-3)
-DATA_ABERTURA = datetime(2026, 12, 1, 0, 0, tzinfo=TZ)       # 01/12/2026 (edital). Para testar agora, troque por uma data passada.
+DATA_ABERTURA = datetime(2026, 11, 1, 0, 0, tzinfo=TZ)       # 01/12/2026 (edital). Para testar agora, troque por uma data passada.
 DATA_ENCERRAMENTO = datetime(2026, 12, 7, 23, 59, tzinfo=TZ)  # 07/12/2026 23h59
 
 NUMERO_INICIAL = 1000  # número da 1ª inscrição
