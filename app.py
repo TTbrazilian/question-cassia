@@ -28,7 +28,7 @@ import streamlit.components.v1 as components
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PLANILHA_LOCAL = os.path.join(APP_DIR, "respostas_ceo.xlsx")
-BANDEIRA_PATH = os.path.join(APP_DIR, "cassiabandeira.png")
+BANDEIRA_PATH = os.path.join(APP_DIR, "cássiabandeira.png")
 
 # ----------------------------------------------------------------------------
 # JANELA DE INSCRIÇÕES  ——  conforme o Edital nº 04/2026 (inscrições 01 a 07/12/2026).
