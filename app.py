@@ -37,7 +37,7 @@ BANDEIRA_PATH = os.path.join(APP_DIR, "cássiabandeira.png")
 # JANELA DE INSCRIÇÕES  ——  conforme o Edital nº 04/2026 (inscrições 01 a 07/12/2026).
 # ----------------------------------------------------------------------------
 TZ = timezone(timedelta(hours=-3))  # Horário de Brasília (UTC-3)
-DATA_ABERTURA = datetime(2026, 11, 1, 0, 0, tzinfo=TZ)       # 01/12/2026 (edital). Para testar agora, troque por uma data passada.
+DATA_ABERTURA = datetime(2026, 12, 1, 0, 0, tzinfo=TZ)       # 01/12/2026 (edital). Para testar agora, troque por uma data passada.
 DATA_ENCERRAMENTO = datetime(2026, 12, 7, 23, 59, tzinfo=TZ)  # 07/12/2026 23h59
 
 NUMERO_INICIAL = 1000  # número da 1ª inscrição
@@ -832,15 +832,16 @@ is_dent = e_dentista(funcao)
 # 2. DADOS PESSOAIS
 st.markdown('<div class="ig2p-faixa">2. Dados Pessoais</div>', unsafe_allow_html=True)
 nome = st.text_input("2. Nome Completo (sem abreviações) *", key="nome")
-cpf = st.text_input("3. CPF — digite apenas os números *", key="cpf", max_chars=14,
-                    help="Pode digitar só os números; a pontuação é aplicada ao registrar.")
+cpf = st.text_input("3. CPF — digite apenas os números *",
+                    key="cpf", max_chars=14, on_change=fmt_cpf,
+                    help="A pontuação (000.000.000-00) é aplicada automaticamente.")
 nascimento = st.text_input("4. Data de Nascimento (dia/mês/ano) — Ex: 01/01/1990 *",
-                           key="nascimento", max_chars=10,
-                           help="Pode digitar só os números (01011990).")
+                           key="nascimento", max_chars=10, on_change=fmt_nascimento,
+                           help="Digite só os números — a barra é inserida automaticamente.")
 email = st.text_input("5. E-mail *", key="email",
                       help="Será usado para o envio da confirmação e das comunicações do processo.")
 telefone = st.text_input("6. Telefone para contato / WhatsApp (com DDD) *",
-                         key="telefone", max_chars=16)
+                         key="telefone", max_chars=16, on_change=fmt_tel)
 endereco = st.text_input("7. Endereço (rua / avenida / logradouro) *", key="endereco")
 cae1, cae2 = st.columns([1, 2])
 with cae1:
@@ -849,8 +850,8 @@ with cae2:
     bairro = st.text_input("9. Bairro *", key="bairro")
 cae3, cae4 = st.columns([1, 2])
 with cae3:
-    cep = st.text_input("10. CEP *", key="cep", max_chars=9,
-                        help="Pode digitar só os números (00000000).")
+    cep = st.text_input("10. CEP *", key="cep", max_chars=9, on_change=fmt_cep,
+                        help="Digite só os números — o traço é inserido automaticamente.")
 with cae4:
     complemento = st.text_input("11. Complemento (opcional)", key="complemento",
                                 help="Apto, bloco, casa, ponto de referência etc. Deixe em branco se não houver.")
@@ -871,7 +872,7 @@ c1, c2 = st.columns([3, 1])
 with c1:
     cro_num = st.text_input("12. Número do registro no CRO *", key="cro_num")
 with c2:
-    cro_uf = st.text_input("UF *", key="cro_uf", max_chars=2,
+    cro_uf = st.text_input("UF *", key="cro_uf", max_chars=2, on_change=fmt_cro_uf,
                            help="Sigla do estado, ex.: MG")
 
 arquivos = {}
